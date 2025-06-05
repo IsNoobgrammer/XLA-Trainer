@@ -1,0 +1,814 @@
+### intial setup
+
+import os
+import pandas as pd
+import numpy as np
+import datasets
+import torch_xla.core.xla_model as xm
+import torch_xla.distributed.parallel_loader as pl
+import torch
+import torch.nn as nn
+import torch_xla.test.test_utils as test_utils
+import torch_xla.distributed.spmd.xla_sharding as xs
+import torch_xla.core.xla_model as xm
+from transformers import (
+ AutoTokenizer, AutoModelForCausalLM, set_seed, DataCollatorWithPadding, AutoConfig 
+)
+
+from transformers import logging as hf_logging
+import torch_xla.runtime as xr
+
+
+# import logging 
+# logging.disable(logging.CRITICAL)
+# import warnings
+# warnings.filterwarnings('ignore') 
+
+xr.use_spmd()
+
+from torch_xla.distributed.spmd.xla_sharding import Mesh
+
+from peft import LoraConfig, TaskType, get_peft_model 
+from datasets import  load_dataset, concatenate_datasets
+from tqdm import tqdm
+
+from torch.utils.data import Dataset as TorchDataset
+from torch_xla.utils.checkpoint import checkpoint
+
+
+try:
+    !export USE_TORCH=True #If we don't do this, transformers will seemingly bork the session upon import. Really weird error.
+    os.environ["PJRT_DEVICE"] = "TPU"
+    os.environ.pop('TPU_PROCESS_ADDRESSES')
+    os.environ.pop('CLOUD_TPU_TASK_ID')
+    hf_logging.set_verbosity_error() # It can still display warnings which is a bit annoying but whatever
+except:
+    pass
+
+
+import os
+# SEQ_LEN=2048
+args = " --xla_jf_spmd_threshold_for_windowed_einsum_mib=0 --xla_tpu_spmd_threshold_for_allgather_cse=10000 --xla_tpu_prefer_async_allgather_to_allreduce=true --xla_tpu_enable_latency_hiding_scheduler=true --xla_tpu_megacore_fusion_allow_ags=false --xla_tpu_enable_flash_attention=true --xla_enable_async_collective_permute=true --xla_tpu_enable_ag_backward_pipelining=true --xla_tpu_enable_data_parallel_all_reduce_opt=true --xla_latency_hiding_scheduler_rerun=1 --xla_tpu_data_parallel_opt_different_sized_ops=true --xla_tpu_enable_async_collective_fusion=true --xla_tpu_enable_async_collective_fusion_multiple_steps=true --xla_tpu_overlap_compute_collective_tc=true --xla_enable_async_all_gather=true --xla_tpu_enable_async_collective_fusion_fuse_all_gather=true TPU_MEGACORE=MEGACORE_DENSE SEQ_LEN=2048 --xla_tpu_use_enhanced_launch_barrier=true"
+
+os.environ['LIBTPU_INIT_ARGS']=args
+os.environ['XLA_FLAGS']="--xla_cpu_enable_fast_math=true --xla_gpu_force_compilation_parallelism=8 "
+# os.environ['XLA_USE_BF16']="1"
+# " --xla_gpu_triton_gemm_any=True  --xla_gpu_enable_while_loop_double_buffering=true  --xla_gpu_enable_pipelined_all_gather=true  --xla_gpu_enable_pipelined_reduce_scatter=true  --xla_gpu_enable_pipelined_all_reduce=true  --xla_gpu_enable_pipelined_collectives=false   --xla_gpu_enable_reduce_scatter_combine_by_dim=false  --xla_gpu_enable_all_gather_combine_by_dim=false  --xla_gpu_enable_reduce_scatter_combine_by_dim=false  --xla_gpu_all_gather_combine_threshold_bytes=8589934592  --xla_gpu_reduce_scatter_combine_threshold_bytes=8589934592  --xla_gpu_all_reduce_combine_threshold_bytes=8589934592  --xla_gpu_multi_streamed_windowed_einsum=true  --xla_gpu_threshold_for_windowed_einsum_mib=0  --xla_gpu_enable_latency_hiding_scheduler=true  --xla_gpu_enable_command_buffer=  "
+os.environ["XLA_TENSOR_ALLOCATOR_MAXSIZE"] = "34359738368"
+
+import os
+os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
+
+#   --xla_tpu_megacore_fusion_allow_ags=true --xla_tpu_enable_ag_backward_pipelining=true  --xla_tpu_prefer_async_allgather_to_allreduce=true
+
+num_devices = xr.global_runtime_device_count()
+model_axis=1
+data_axis=4
+mesh_shape = (data_axis, model_axis )
+device_ids = np.array(range(num_devices))
+mesh = Mesh(device_ids, mesh_shape, ('fsdp' ,'data'))
+xs.set_global_mesh(mesh)
+
+
+### check info 
+
+!tpu-info
+
+
+### configuration 
+
+MAX_INPUT=2048#128*16 #context-size
+MODEL = "Ornaments/Jalwa-latest-run-pretrain-10k" #You should be able to use 7B model with no changes! There should be enough HBM
+SAVED_MODEL = "fhai50032/TamedShawty"
+# !export XLA_TENSOR_ALLOCATOR_MAXSIZE=1000000
+
+from transformers import AutoTokenizer
+tokenizer = AutoTokenizer.from_pretrained(MODEL)
+if 'pad_token' not in tokenizer.special_tokens_map:
+  tokenizer.pad_token=tokenizer.eos_token
+
+
+### :-> add option to provide own chat_template
+# tokenizer.chat_template="""
+# {% set system_message = 'You are BiBo, a helpful and friendly AI assistant developed by aloobun and LowIQGenAI.' %}
+# {%- if messages and messages[0]['role'] == 'system' %}
+#     {{- '<|im_start|>system\\n' + (messages[0]['content'] if 'content' in messages[0] else messages[0]['value'] if 'value' in messages[0] else '') + '<|im_end|>\\n' }}
+# {%- else %}
+#     {{- '<|im_start|>system\\n' + system_message + '<|im_end|>\\n' }}
+# {%- endif %}
+# {%- for message in messages %}
+#     {%- set content = message['content'] if 'content' in message else message['value'] if 'value' in message else '' %}
+#     {%- if message['role'] in ['user', 'human'] %}
+#         {{- '<|im_start|>user\\n' + content + '<|im_end|>\\n' }}
+#     {%- elif message['role'] in ['assistant', 'gpt'] %}
+#         {{- '<|im_start|>assistant\\n' + content + '<|im_end|>\\n' }}
+#     {%- endif %}
+# {%- endfor %}
+# {%- if add_generation_prompt %}
+#     {{- '<|im_start|>assistant\\n' }}
+# {%- endif %}
+# """
+
+print(f"Tokens :\n {tokenizer.special_tokens_map} \n\n")
+print(tokenizer.chat_template)
+
+
+# make it more specific and modular and also create a dataset class for pretraining where we don't apply chat_template 
+# also take user's input for the field of data (default messages for ConversationDataset and text for pretrain one)
+
+class ConversationDataset(TorchDataset):
+    def __init__(self, tokenizer, max_length=2048, dataset=None):
+        self.dataset = dataset
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def __getitem__(self, idx):
+        # Get the text from the dataset
+        text=tokenizer.decode(self.dataset[idx]["input_ids"])
+        
+        # text = tokenizer.apply_chat_template(self.dataset[idx]["messages"],tokenize=False)
+
+        # Tokenize the text
+        input_ids = self.tokenizer(
+            text,
+            add_special_tokens=True,
+            max_length=self.max_length,
+            truncation=True,
+            padding="max_length",
+            return_attention_mask=True,
+            return_tensors="pt"
+        )
+
+        # Return the tokenized input
+        return {
+            "input_ids": input_ids["input_ids"].squeeze(0),
+            "labels": input_ids["input_ids"].squeeze(0),  # For language modeling, labels are the same as input_ids
+            "attention_mask": input_ids["attention_mask"].squeeze(0),
+        }
+
+
+train_dataset="tinycompany/Instruct-packed-2K-Context-tk-QTK-81K"
+test_dataset="tinycompany/Instruct-packed-2K-Context-tk-QTK-81K"
+
+train_data = load_dataset(train_dataset,split="train").shuffle(seed=420)
+val = (load_dataset(test_dataset,split="train[96%:]")).shuffle(seed=69)
+
+FLAGS = {'MAX_INPUT': MAX_INPUT,
+         'LOGGING_STEPS': 50,
+         'NUM_EPOCHS': 3,
+         'PAUSE_STEPS':20000, # asks to exit training after x steps , #todo checkpoint saving me no lazy
+         'MAX_STEPS': -1,#Ooverides num epochs
+         'BATCH_SIZE': 96, #   This is the Batch_size per core so global batch_size would be BATCH_SIZE*8
+         'LEN_TRAIN_DATA': len(train_data),
+         'VAL_STEPS': 1000,
+         'VAL_BATCH': 16,
+         'GRAD_ACCUMULATION_STEP':1,
+         'MAX_GRAD_CLIP':1,
+        'LEARNING_RATE':3e-4,
+         'WARMUP_RATIO':0.1,
+         'OPTIMIZER':'lion', # default = 'adamw'  options->  ['adamw','SM3','came','adafactor','lion']           
+         'SCHEDULAR':'cosine', # default= 'cosine'     options:-> ['linear','cosine']
+         'WEIGHT_DECAY':0.05,
+         'TRAIN_DATASET':train_dataset,
+         "TEST_DATASET":test_dataset,
+         'WANDB':True,
+        'PROJECT':'Instruct-Shawty',
+        } # Indian pun :)
+
+# custom optimized attention for tpu ; need to create 2 wrapper one for normal and one where qknorm is used 
+
+import torch
+import torch.nn as nn
+from typing import Optional, Tuple
+from splash import SplashAttentionConfig, splash_attention
+from transformers.models.llama.modeling_llama import apply_rotary_pos_emb
+
+SPLASH_ATTENTION_AVAILABLE = True
+
+class SplashAttentionWrapper(nn.Module):
+    def __init__(
+        self,
+        original_attention: nn.Module,
+        config: SplashAttentionConfig,
+    ):
+        """
+        A wrapper to replace the original attention mechanism with Splash Attention.
+
+        Args:
+            original_attention: The original attention module (e.g., LlamaAttention).
+            config: An instance of SplashAttentionConfig containing all necessary parameters.
+        """
+        super().__init__()
+        self.original_attention = original_attention
+        self.config = config
+
+        # Extract attributes from original attention
+        self.num_heads = original_attention.config.num_attention_heads
+        self.num_kv_heads = original_attention.config.num_key_value_heads
+        self.head_dim = original_attention.head_dim
+        self.scaling = original_attention.scaling
+        self.layer_idx = original_attention.layer_idx
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        position_embeddings: Tuple[torch.Tensor, torch.Tensor],
+        attention_mask: Optional[torch.Tensor] = None,
+        past_key_value: Optional["Cache"] = None,
+        cache_position: Optional[torch.LongTensor] = None,
+        **kwargs
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        bsz, q_len, _ = hidden_states.size()
+
+        # Compute Q, K, V
+        query_states = self.original_attention.q_proj(hidden_states)
+        key_states = self.original_attention.k_proj(hidden_states)
+        value_states = self.original_attention.v_proj(hidden_states)
+
+        # Reshape for multi-head attention
+        query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
+        key_states = key_states.view(bsz, q_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        value_states = value_states.view(bsz, q_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
+
+        # Apply rotary embeddings
+        cos, sin = position_embeddings
+        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+
+        # Handle KV cache
+        if past_key_value is not None:
+            cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
+            key_states, value_states = past_key_value.update(
+                key_states, value_states, self.layer_idx, cache_kwargs
+            )
+
+        # Ensure tensors are contiguous
+        query_states = query_states.contiguous()
+        key_states = key_states.contiguous()
+        value_states = value_states.contiguous()
+
+        # Scale query states
+        query_states = query_states * self.scaling
+
+        # Call Splash Attention with the provided config
+        attn_output = splash_attention(
+            query_states,
+            key_states,
+            value_states,
+            self.config.to_json(),
+            decoder_segment_ids=None,
+            attn_logits_soft_cap=None,
+        )
+
+        # Reshape output and apply output projection
+        attn_output = attn_output.transpose(1, 2).contiguous().view(bsz, q_len, -1)
+        attn_output = self.original_attention.o_proj(attn_output)
+
+        return attn_output, None
+
+print(f"SPLASH_ATTENTION_AVAILABLE : {SPLASH_ATTENTION_AVAILABLE}")
+
+
+# similarly for flash 
+
+import torch
+import torch.nn as nn
+from transformers import AutoModelForCausalLM
+import torch_xla.core.xla_model as xm
+import torch_xla.distributed.spmd.xla_sharding as xs
+from typing import Optional, Tuple
+
+# Assuming XLA Flash Attention is available as defined
+from torch_xla.experimental.custom_kernel import flash_attention
+FLASH_ATTENTION_AVAILABLE = True
+print(f" IS FLASH ATTENTION AVAILABLE  : {FLASH_ATTENTION_AVAILABLE}")
+
+def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
+    batch, num_key_value_heads, slen, head_dim = hidden_states.shape
+    if n_rep == 1:
+        return hidden_states
+    hidden_states = hidden_states[:, :, None, :, :].expand(
+        batch, num_key_value_heads, n_rep, slen, head_dim
+    )
+    return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
+
+
+class XLAFlashAttentionWrapper(nn.Module):
+    def __init__(self, original_attention, mesh, partition_spec):
+        super().__init__()
+        self.original_attention = original_attention
+        self.mesh = mesh
+        self.partition_spec = partition_spec
+        self.num_heads = original_attention.config.num_attention_heads
+        self.num_kv_heads = original_attention.config.num_key_value_heads
+        self.num_kv_groups = self.num_heads // self.num_kv_heads  # Compute groups
+        self.head_dim = original_attention.head_dim
+        self.hidden_size = original_attention.config.hidden_size
+        self.scaling = original_attention.scaling
+        self.layer_idx = original_attention.layer_idx
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        position_embeddings: Tuple[torch.Tensor, torch.Tensor],
+        attention_mask: Optional[torch.Tensor] = None,
+        past_key_value: Optional['Cache'] = None,
+        cache_position: Optional[torch.LongTensor] = None,
+        **kwargs
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+        bsz, q_len, _ = hidden_states.size()
+
+        # Compute Q, K, V
+        query_states = self.original_attention.q_proj(hidden_states)
+        key_states = self.original_attention.k_proj(hidden_states)
+        value_states = self.original_attention.v_proj(hidden_states)
+
+        # Reshape for multi-head attention
+        query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
+        key_states = key_states.view(bsz, q_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        value_states = value_states.view(bsz, q_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
+
+        # Apply rotary positional embeddings
+        cos, sin = position_embeddings
+        from transformers.models.qwen2.modeling_qwen2 import apply_rotary_pos_emb
+        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+
+        # Handle KV cache
+        if past_key_value is not None:
+            cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
+            key_states, value_states = past_key_value.update(
+                key_states, value_states, self.layer_idx, cache_kwargs
+            )
+
+        # Repeat key and value states for GQA to match query heads
+        if self.num_kv_groups > 1:
+            key_states = repeat_kv(key_states, self.num_kv_groups)
+            value_states = repeat_kv(value_states, self.num_kv_groups)
+
+        # Ensure tensors are contiguous
+        query_states = query_states.contiguous()
+        key_states = key_states.contiguous()
+        value_states = value_states.contiguous()
+
+        # Apply XLA Flash Attention
+        attn_output = flash_attention(
+            q=query_states,  # [bsz, num_heads, q_len, head_dim]
+            k=key_states,    # [bsz, num_heads, kv_len, head_dim] after repeat
+            v=value_states,  # [bsz, num_heads, kv_len, head_dim] after repeat
+            causal=True,     # Qwen2 uses causal attention, not False
+            sm_scale=self.scaling,
+            partition_spec=self.partition_spec,
+            mesh=self.mesh
+        )
+
+        # Reshape output and apply output projection
+        attn_output = attn_output.transpose(1, 2).contiguous().view(bsz, q_len, self.hidden_size)
+        attn_output = self.original_attention.o_proj(attn_output)
+
+        return attn_output, None
+
+
+
+
+from torch_xla.utils.checkpoint import checkpoint
+
+model = AutoModelForCausalLM.from_pretrained(MODEL,torch_dtype=torch.bfloat16,trust_remote_code=True)
+model._set_gradient_checkpointing(enable=True, gradient_checkpointing_func=checkpoint)
+
+for layer in model.model.layers:
+    # layer.self_attn.flash_attention_impl = flash_attention_2 ??
+    xs.apply_backward_optimization_barrier(layer)
+    
+with torch.no_grad():
+    if SPLASH_ATTENTION_AVAILABLE:
+
+        config_default=SplashAttentionConfig(
+            mesh=str(xs.get_global_mesh()),
+            qkv_partition_spec=(("fsdp", "data"),None ,None, None),
+            segment_ids_partition_spec=(("fsdp", "data"),None))
+                
+        config_2048 = SplashAttentionConfig(
+            mesh=str(xs.get_global_mesh()),
+            qkv_partition_spec=(("fsdp", "data"),None ,None, None),
+            segment_ids_partition_spec=(("fsdp", "data"),None),
+            sa_block_q=512,
+            sa_block_kv=512,
+            sa_block_kv_compute=512,
+            sa_block_q_dkv=512,
+            sa_block_kv_dkv=512,
+            sa_block_kv_dkv_compute=512,
+            sa_block_q_dq=512,
+            sa_block_kv_dq=512,
+        )
+        
+        config_1024 = SplashAttentionConfig(
+            mesh=str(xs.get_global_mesh()),
+            qkv_partition_spec=(0, 1, None, None),
+            segment_ids_partition_spec=(0, None),
+            sa_block_q=256,
+            sa_block_kv=256,
+            sa_block_kv_compute=256,
+            sa_block_q_dkv=256,
+            sa_block_kv_dkv=256,
+            sa_block_kv_dkv_compute=256,
+            sa_block_q_dq=256,
+            sa_block_kv_dq=256,
+        )
+        
+
+        old_atten_config=[]
+        
+        for layer in model.model.layers:
+            original_attention = layer.self_attn
+            layer.self_attn = SplashAttentionWrapper(original_attention, config=config_2048)
+            old_atten_config.append(original_attention)
+        print("Applied Splash Attention for TPU ; Saved Old Attention config for replacement after training")
+
+model.config.use_cache=False
+train_data = ConversationDataset(tokenizer, dataset=train_data, max_length=FLAGS['MAX_INPUT'])
+val = ConversationDataset(tokenizer, dataset=val)
+
+
+# log these in a log file 
+for name,param in model.named_parameters():
+    print(name,param.shape)
+
+!tpu-info
+
+
+
+def get_nb_trainable_parameters(model):
+        r"""
+        Returns the number of trainable parameters and number of all parameters in the model.
+        """
+        trainable_params = 0
+        all_param = 0
+        for _, param in model.named_parameters():
+            num_params = param.numel()
+            # if using DS Zero 3 and the weights are initialized empty
+            if num_params == 0 and hasattr(param, "ds_numel"):
+                num_params = param.ds_numel
+
+            # Due to the design of 4bit linear layers from bitsandbytes
+            # one needs to multiply the number of parameters by 2 to get
+            # the correct number of parameters
+            if param.__class__.__name__ == "Params4bit":
+                num_params = num_params * 2
+
+            all_param += num_params
+            if param.requires_grad:
+                trainable_params += num_params
+
+        return trainable_params, all_param
+def print_trainable_parameters(model):
+        """
+        Prints the number of trainable parameters in the model.
+        """
+        trainable_params, all_param = get_nb_trainable_parameters(model)
+        
+        print(
+            f"trainable params: {trainable_params:,d} || all params: {all_param:,d} || trainable%: {100 * trainable_params / all_param}"
+        )
+    
+print_trainable_parameters(model)
+
+
+# sampler 
+training_loader = torch.utils.data.DataLoader(train_data, batch_size=FLAGS["BATCH_SIZE"], sampler=None,drop_last=True)
+testing_loader = torch.utils.data.DataLoader(val, batch_size=FLAGS["BATCH_SIZE"], sampler=None,drop_last=True)
+
+
+print(f"Max Steps:- {len(training_loader)}  , eFFECTIVE bATCH size {xr.world_size()*FLAGS['BATCH_SIZE']} Input")
+print(f"Val Size:- {len(testing_loader)}  , eFFECTIvE bATCH size {xr.world_size() *FLAGS['BATCH_SIZE']} Input")
+FLAGS['STEPS']=len(training_loader)
+FLAGS['BATCH_DATA']=FLAGS['BATCH_SIZE']
+# print(device)
+
+
+# spmd xla_sharding
+
+def partition_module(model, mesh, device=xm.xla_device(), verbose=False):
+    model.to(device)
+    # print(rule)
+    for name, param in model.named_parameters():
+
+ 
+        if 1 > 0:
+            if len(param.shape) == 1:
+                continue
+
+            if 'embed_tokens' in name:
+                xs.mark_sharding(param, mesh, ('mp', 'fsdp'))
+                print('> [2D] Sharding tensor', name, param.shape)
+            elif 'q_proj' in name or 'k_proj' in name or 'v_proj'  in name:
+                xs.mark_sharding(param, mesh, ('fsdp', 'mp'))
+                print('> [2D] Sharding tensor', name, param.shape)
+            elif 'o_proj' in name:
+                xs.mark_sharding(param, mesh, ('mp', 'fsdp'))
+                print('> [2D] Sharding tensor', name, param.shape)
+            elif 'gate_proj' in name or 'up_proj' in name:
+                xs.mark_sharding(param, mesh, ('mp', 'fsdp'))
+                print('> [2D] Sharding tensor', name, param.shape)
+            elif 'down_proj' in name:
+                xs.mark_sharding(param, mesh, ('fsdp', 'mp'))
+                print('> [2D] Sharding tensor', name, param.shape)
+            elif 'lm_head' in name:
+                xs.mark_sharding(param, mesh, ('mp', 'fsdp'))
+                print('> [2D] Sharding tensor', name, param.shape)
+            else:
+                continue
+
+
+import torch_xla.distributed.parallel_loader as pl
+
+
+# xr.initialize_cache('/tmp/xla_cache', readonly=False)  ## Cache is already Init
+ 
+
+device = xm.xla_device()
+model = model.to(device)
+from torch_xla.distributed.fsdp.utils import apply_xla_patch_to_nn_linear  
+model = apply_xla_patch_to_nn_linear(model, xs.xla_patched_nn_linear_forward)  
+num_devices = xr.global_runtime_device_count()
+# model_axis=2
+# data_axis=4
+# mesh_shape = (data_axis, model_axis )
+# device_ids = np.array(range(num_devices))
+# mesh = Mesh(device_ids, mesh_shape, ('fsdp' ,'mp'))
+partition_module(model, mesh)
+training_loader = pl.MpDeviceLoader(training_loader
+                                    , device,
+                                    batches_per_execution=1,  # Prefetch 4 batches
+                                    loader_prefetch_size=4,
+                                    device_prefetch_size=4,
+                                    input_sharding=xs.ShardingSpec(
+                                                        mesh, (0,None), 
+                                    #     minibatch=True
+                                                                                        ),
+                                    
+                                    
+                                   )
+testing_loader = pl.MpDeviceLoader(testing_loader, device,
+                                   # batches_per_execution=16,  # Prefetch 4 batches
+                                   #  loader_prefetch_size=8,
+                                   #  device_prefetch_size=4
+                                  )
+
+
+if hasattr(model, "tie_weights"):
+    print('tie_weight')
+    model.tie_weights()
+
+# torch_xla.experimental.optimize.enable_xla_softmax_fusion(True)
+
+mesh_shape
+
+# xs.configure_collective_opt(enable_while=True, enable_allgather=True)
+
+
+#### :-> log FLAGS
+
+
+
+import torch
+import torch.nn as nn
+import wandb
+import torch_xla.amp  # needed for XLA autocast
+from torch_xla.amp.syncfree import AdamW
+from transformers import get_linear_schedule_with_warmup, get_cosine_schedule_with_warmup
+from optims.optim import SM3, CAME, Adafactor
+import torch.nn.functional as F
+# from grokfast_pytorch import GrokFastAdamW
+# from lion_pytorch import Lion
+from torch_xla.distributed.zero_redundancy_optimizer import ZeroRedundancyOptimizer as ZeRO
+# from adamw_bf16 import AdamWBF16
+# from torchao.prototype.low_bit_optim import AdamW4bit
+
+__wandb__ = True  # Set based on your FLAGS
+
+
+# # # # @torch_xla.compile
+def evaluate_loss(outputs, labels, pad_id=tokenizer.pad_token_id,entropy=False):
+
+    temperature = 0.85
+    
+    logits = outputs.logits[..., :-1, :].contiguous()  
+    labels = labels[..., 1:].contiguous()   
+
+
+    loss_fct = nn.CrossEntropyLoss(ignore_index=pad_id)
+    
+
+    if entropy:
+        
+        log_probs = F.log_softmax(logits, dim=-1)
+        # probs = F.softmax(logits, dim=-1)
+        # earlier it was probs*log_probs
+        entropy = -(torch.exp(log_probs) * log_probs).sum(dim=-1).mean()
+
+        
+        smoothed_logits = logits / temperature
+        ce_loss = loss_fct(smoothed_logits.view(-1, smoothed_logits.size(-1)), labels.view(-1))
+        final_loss=ce_loss + 0.001 * entropy
+
+        return ce_loss , entropy, final_loss
+
+    else: 
+        
+        ce_loss = loss_fct(logits.view(-1, logits.size(-1)), labels.view(-1))
+        return ce_loss
+
+
+        
+    
+    
+
+
+# # @torch_xla.compile(full_graph=True)
+def train_step(input_ids, labels, attention_mask,model,pad_id):
+    # cache_config = QuantizedCacheConfig(nbits=4, axis_key=1, axis_value=1, device=xm.xla_device())
+    # past_key_values = HQQQuantizedCache(cache_config=cache_config)
+    with torch_xla.amp.autocast(device=device):
+    # with torch_xla.step():
+        outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+        
+        loss = evaluate_loss(outputs, labels,pad_id,entropy=True)
+    return loss
+
+
+
+def train(FLAGS):
+    global val_step, device
+    update_params = filter(lambda p: p.requires_grad, model.parameters())
+    num_iterations = int((FLAGS["NUM_EPOCHS"] * FLAGS['STEPS']) // FLAGS['GRAD_ACCUMULATION_STEP'])
+    warmup_steps = int(num_iterations * FLAGS['WARMUP_RATIO'])
+
+    aux_loss_beta = FLAGS.get('AUX_LOSS_BETA', 0.0)
+    
+    if __wandb__:
+        wandb.init(project=FLAGS['PROJECT'], config=FLAGS)
+        wandb.define_metric("Validation_loss", step_metric="val_step")
+        wandb.define_metric("Learning_rate", step_metric="train_step")
+        wandb.define_metric("train_ce_loss", step_metric="train_step")
+        wandb.define_metric("train_entropy", step_metric="train_step")
+        wandb.define_metric("train_loss", step_metric="train_step")
+        wandb.define_metric("grad_norm", step_metric="train_step")
+        
+        
+    
+    optimizer_name = FLAGS['OPTIMIZER'].lower()
+    if optimizer_name == 'adamw':
+        xm.master_print("Using Adum")
+        optimizer = AdamW(update_params, eps=1e-8, lr=FLAGS['LEARNING_RATE'],
+                            betas=(0.9, 0.995), weight_decay=FLAGS['WEIGHT_DECAY'])
+        
+        # optimizer=SPMDCAME(model.parameters(),mesh=mesh,partition_spec=(0,None),lr=FLAGS['LEARNING_RATE'] , weight_decay=FLAGS['WEIGHT_DECAY'])
+    elif optimizer_name == 'lion':
+        xm.master_print(f"Using Lion Optim")
+        optimizer = Lion(update_params, lr=FLAGS['LEARNING_RATE']/5, weight_decay=FLAGS['WEIGHT_DECAY'])
+    elif optimizer_name == 'adafactor':
+        optimizer = Adafactor(update_params, lr=FLAGS['LEARNING_RATE'],
+                              weight_decay=FLAGS['WEIGHT_DECAY'], scale_parameter=False, relative_step=False)
+    elif optimizer_name == 'came':
+        optimizer = CAME(model.parameters(), lr=FLAGS['LEARNING_RATE'],
+                         weight_decay=FLAGS['WEIGHT_DECAY'], betas=(0.9, 0.999, 0.9999), eps=(1e-30, 1e-16))
+    else:
+        xm.master_print(f"Using GrokFastAdamW Optim")
+        optimizer = GrokFastAdamW(model.parameters(), lr=FLAGS['LEARNING_RATE'],weight_decay=FLAGS['WEIGHT_DECAY'])
+        # optimizer = AdamW_BF16(model.parameters(), lr_function=LR(lr=5e-5, preheat_steps=5000, decay_power=-0.25))
+    
+    # Print device for verification
+    for param_group in optimizer.param_groups:
+        if param_group["params"]:
+            print(param_group["params"][0].device)
+            break
+
+    # optimizer_2=Lion(model.parameters(), lr=FLAGS['LEARNING_RATE']/10, weight_decay=FLAGS['WEIGHT_DECAY'])
+
+    if FLAGS['SCHEDULAR'].lower() == 'linear':
+        scheduler = get_linear_schedule_with_warmup(optimizer, warmup_steps, num_iterations)
+    else:
+        scheduler = get_cosine_schedule_with_warmup(optimizer, warmup_steps, num_iterations)
+    
+    val_step = 0
+    should_break = False
+    for epoch in range(1, FLAGS['NUM_EPOCHS'] + 1):
+        if should_break:
+            break
+
+        model.train()
+        xm.master_print(f'Epoch {epoch} train begin {test_utils.now()}')
+
+        for step, batch in enumerate(training_loader):
+            # !tpu-info
+            input_ids = batch["input_ids"].to(device)
+            labels = batch["labels"].to(device)
+            attention_mask = batch["attention_mask"].to(device)
+
+            # Shard data across TPU cores
+            xs.mark_sharding(input_ids, mesh, (0, None))
+            xs.mark_sharding(labels, mesh, (0, None))
+            xs.mark_sharding(attention_mask, mesh, (0, None))
+
+            loss,entropy,final_loss=train_step(input_ids, labels, attention_mask,model,tokenizer.pad_token_id)
+
+            final_loss /=  FLAGS['GRAD_ACCUMULATION_STEP']
+            final_loss.backward()
+            
+
+            
+            if (step + 1) % FLAGS['LOGGING_STEPS'] == 0:
+                loss_item = loss.clone().item()
+                entropy_item=entropy.detach().item()
+                total_norm = torch.nn.utils.clip_grad_norm_(
+                    model.parameters(), 
+                    max_norm=float('inf'),  # Don't actually clip, just compute
+                    norm_type=2.0
+                )
+                grad_norm=total_norm.item()
+                # ce_loss=loss
+                xm.master_print(f'Full loss: {loss_item} ;; , time: {test_utils.now()}, step: {step + 1} ;; CCE Loss {loss_item} ;; Entropy Loss {entropy}')
+                # CCE Loss {ce_loss.detach().cpu().item()} ;; Entropy Loss {entropy.detach().cpu().item()}
+                if __wandb__:
+                    wandb.log({
+                        'Learning_rate': optimizer.param_groups[0]['lr'],
+                        'train_loss': loss_item + 0.0001 * entropy_item,
+                        'train_ce_loss': loss_item,
+                        'train_entropy': entropy,
+                        'grad_norm':grad_norm,
+                        'train_step': (step + 1 + ((epoch - 1) * FLAGS["STEPS"]))// FLAGS['GRAD_ACCUMULATION_STEP'] ,
+                    })
+            
+            # Backward pass
+            
+            # Gradient accumulation and update
+            if (step + 1) % FLAGS['GRAD_ACCUMULATION_STEP'] == 0:
+                xm.reduce_gradients(optimizer)
+                # xm.reduce_gradients(optimizer_2)
+                # optimizer_2.step()
+                scheduler.step()
+                xm.optimizer_step(optimizer, pin_layout=True, barrier=True)
+                optimizer.zero_grad(set_to_none=True)
+                # optimizer_2.zero_grad(set_to_none=True)
+                torch_xla.sync(wait=True)
+
+            
+            # Validation step
+            if (step + 1) % FLAGS['VAL_STEPS'] == 0:
+                model.eval()
+                total_loss, total_steps = 0.0, 0
+                with torch.no_grad():
+                    for val_step_idx, val_batch in enumerate(testing_loader):
+                        if (val_step_idx + 1) > FLAGS["VAL_BATCH"]:
+                            break
+                        val_input_ids = val_batch["input_ids"].to(device)
+                        val_labels = val_batch["labels"].to(device)
+                        val_attention_mask = val_batch["attention_mask"].to(device)
+                        
+                        xs.mark_sharding(val_input_ids, mesh, (0, None))
+                        xs.mark_sharding(val_labels, mesh, (0, None))
+                        xs.mark_sharding(val_attention_mask, mesh, (0, None))
+                        
+                        with torch_xla.amp.autocast(device=device):
+                            val_outputs = model(input_ids=val_input_ids, attention_mask=val_attention_mask)
+                            val_loss = evaluate_loss(val_outputs, val_labels)
+                        
+                        total_loss += val_loss.item()
+                        total_steps += 1
+                        xm.master_print(f'----- Time -> {test_utils.now()} ----- Validation Batch -> {total_steps} ---- Validation Loss -> {val_loss.item():.4f}')
+                        if __wandb__:
+                            val_step += 1
+                            wandb.log({'Validation_loss': val_loss.item(), 'val_step': val_step})
+                
+                average_loss = total_loss / total_steps if total_steps > 0 else 0
+                xm.master_print(f'----- Time -> {test_utils.now()} ----- Validation Loss (avg over {total_steps} batches) -> {average_loss:.7f}')
+                model.train()
+            
+            # Pause training if required
+            if (step + 1) % FLAGS['PAUSE_STEPS'] == 0:
+                user_input = input(f'Continue training after {step + 1} steps? (yes/no): ')
+                if "no" in user_input.lower():
+                    should_break = True
+                    break
+
+
+
+!wandb login 007c9f3f1c5b7298517b923e2b66908a6fe1a458
+
+model.zero_grad()
+torch_xla.sync(wait=True)
+# import torch._dynamo
+# torch._dynamo.config.suppress_errors = True
+train(FLAGS)
+if FLAGS['WANDB']:
+    wandb.finish()
+
+
+model.zero_grad()
+# torch_xla.sync()
+model.to("cpu")
+
+
+
