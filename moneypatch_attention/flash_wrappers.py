@@ -123,9 +123,6 @@ class XLAFlashAttentionQKNormWrapper(nn.Module):
         self.scaling = original_attention.scaling
         self.layer_idx = original_attention.layer_idx
 
-        # Add QK normalization layers (Qwen3-style)
-        self.q_norm = nn.LayerNorm(self.head_dim, elementwise_affine=True)
-        self.k_norm = nn.LayerNorm(self.head_dim, elementwise_affine=True)
 
     def forward(
         self,
@@ -141,10 +138,10 @@ class XLAFlashAttentionQKNormWrapper(nn.Module):
 
         # Compute Q, K, V with QK normalization (Qwen3-style)
         # Apply normalization BEFORE transpose - this is the key difference
-        query_states = self.q_norm(
+        query_states = self.original_attention.q_norm(
             self.original_attention.q_proj(hidden_states).view(hidden_shape)
         ).transpose(1, 2)
-        key_states = self.k_norm(
+        key_states = self.original_attention.k_norm(
             self.original_attention.k_proj(hidden_states).view(hidden_shape)
         ).transpose(1, 2)
         value_states = self.original_attention.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
@@ -188,7 +185,7 @@ class XLAFlashAttentionQKNormWrapper(nn.Module):
             )
 
         # Reshape output using input_shape and apply output projection
-        bsz, q_len = input_shape
+        attn_output = attn_output.transpose(1, 2).contiguous()
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
         attn_output = self.original_attention.o_proj(attn_output)
 
