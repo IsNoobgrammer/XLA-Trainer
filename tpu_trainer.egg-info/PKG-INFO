@@ -1,0 +1,8 @@
+Metadata-Version: 2.1
+Name: tpu-trainer
+Version: 0.1.0
+Requires-Python: >=3.8
+Requires-Dist: torch>=1.10.0
+Requires-Dist: numpy>=1.19.0
+Requires-Dist: tqdm>=4.62.0
+Requires-Dist: wandb>=0.12.0
