@@ -54,12 +54,15 @@ See the TODO section below for planned features and research directions.
 - **Goal:** Implement and benchmark advanced optimizers, including a robust Newton-Schulz update, AdamW, Lion, and Muon.
 - **Reference:**  
   - [PyTorch Optimizer API](https://pytorch.org/docs/stable/optim.html)
+  - [SyncFree Optimizers Paper](https://assets.amazon.science/0d/65/ef1c9262430e9d2ed1a58a6744e6/syncfree-optimizers-and-compiler-improvements-for-efficient-model-training.pdf)
 - **Notes:**  
   - Newton-Schulz is useful for matrix inverse roots (e.g., in second-order methods).
   - Lion and Muon are recent optimizers for LLMs.
+  - **✅ COMPLETED:** SyncFree AdamW optimizer implemented in `optimizers/` directory.
 - **Action Items:**
-  - Modularize optimizer code.
-  - Add/test new optimizers.
+  - ✅ Modularize optimizer code.
+  - ✅ Add SyncFree AdamW optimizer.
+  - 🔄 Add Lion, Muon, and other advanced optimizers.
 
 ### 5. Config File (YAML)
 - **Goal:** Centralize all hyperparameters and settings in a YAML config.
@@ -90,6 +93,39 @@ See the TODO section below for planned features and research directions.
 
 ---
 
+## Features
+
+### XLA-Optimized Optimizers
+
+The `optimizers/` directory contains XLA-optimized optimizers specifically designed for efficient TPU training:
+
+#### SyncFree AdamW
+- **Purpose:** Eliminates CPU synchronization overhead during inf/NaN checks
+- **Benefits:** ~20% faster training on TPUs compared to standard AdamW
+- **Usage:**
+  ```python
+  from optimizers import SyncFreeAdamW
+  
+  optimizer = SyncFreeAdamW(
+      model.parameters(),
+      lr=1e-3,
+      weight_decay=1e-2
+  )
+  ```
+- **Key Features:**
+  - Device-side inf/NaN checking to avoid CPU-device synchronization
+  - Better XLA graph compilation due to reduced host-device communication
+  - Drop-in replacement for standard PyTorch AdamW
+
+#### Planned Optimizers
+- **Lion:** Memory-efficient optimizer using sign-based updates
+- **Muon:** Second-order optimizer with momentum for large-scale training
+- **MARS:** Memory-aware robust scaling for distributed training
+
+For detailed documentation, see [`optimizers/README.md`](optimizers/README.md).
+
+---
+
 ## Directory Structure
 
 ```
@@ -98,14 +134,30 @@ TPU-Trainer/
 │   ├── conversation_dataset.py  # Modular chat dataset
 │   ├── pretrain_dataset.py      # Modular pretrain dataset
 │   └── ...
+├── optimizers/
+│   ├── __init__.py              # Optimizer package init
+│   ├── syncfree_adamw.py        # SyncFree AdamW implementation
+│   ├── test_syncfree_adamw.py   # Tests for SyncFree AdamW
+│   └── README.md                # Optimizer documentation
 ├── moneypatch_attention/
 │   ├── splash.py                # Splash/FlashAttention logic
 │   ├── flash_wrappers.py        # Wrappers for FlashAttention
 │   └── splash_wrappers.py       # Wrappers for SplashAttention
+├── losses/
+│   ├── cross_entropy.py         # Standard cross-entropy loss
+│   ├── cut_cross_entropy.py     # Memory-efficient CCE loss
+│   └── ...
+├── metrics/
+│   ├── compute.py               # Metric computation utilities
+│   ├── logger.py                # Logging utilities
+│   └── ...
 ├── tests/
 │   ├── test_datasets.py         # Dataset tests
 │   ├── test_flash_wrappers.py   # FlashAttention tests
 │   └── test_splash_wrappers.py  # SplashAttention tests
+├── examples/
+│   ├── syncfree_adamw_example.py # SyncFree AdamW usage example
+│   └── ...
 ├── example_usage.py             # Example usage script
 ├── script.txt                   # Notes, scripts, or logs
 └── ...
